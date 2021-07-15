@@ -790,6 +790,12 @@ var Observer = function Observer (value, key) {
       ? protoAugment
       : copyAugment;
     augment(value, arrayMethods, arrayKeys);
+    // 微信小程序中使用插件，数组对象上会直接挂载`push、pop、sort`等方法
+    // 导致mpvue对隐式原型的覆盖无效，无法感知用户对数组的操作
+    if (hasProto) {
+      var ownMethods = hasOwnArrayMethods(value, arrayKeys);
+      ownMethods.length && copyAugment(value, arrayMethods, ownMethods);
+    }
     this.observeArray(value);
   } else {
     this.walk(value);
@@ -816,6 +822,21 @@ Observer.prototype.observeArray = function observeArray (items) {
     observe(items[i]);
   }
 };
+
+/**
+ * 判断当前数组上是否被挂载了数组方法
+ */
+function hasOwnArrayMethods (value, keys) {
+  var ownMethods = [];
+  /* eslint-disable no-proto */
+  keys.forEach(function (key) {
+    if (value[key] !== value.__proto__[key]) {
+      ownMethods.push(key);
+    }
+  });
+  /* eslint-enable no-proto */
+  return ownMethods
+}
 
 // helpers
 
@@ -3866,20 +3887,20 @@ function dedupe (latest, extended, sealed) {
   }
 }
 
-function Vue$3 (options) {
+function Vue$2 (options) {
   if ("production" !== 'production' &&
-    !(this instanceof Vue$3)
+    !(this instanceof Vue$2)
   ) {
     warn('Vue is a constructor and should be called with the `new` keyword');
   }
   this._init(options);
 }
 
-initMixin(Vue$3);
-stateMixin(Vue$3);
-eventsMixin(Vue$3);
-lifecycleMixin(Vue$3);
-renderMixin(Vue$3);
+initMixin(Vue$2);
+stateMixin(Vue$2);
+eventsMixin(Vue$2);
+lifecycleMixin(Vue$2);
+renderMixin(Vue$2);
 
 /*  */
 
@@ -4171,21 +4192,21 @@ function initGlobalAPI (Vue) {
   initAssetRegisters(Vue);
 }
 
-initGlobalAPI(Vue$3);
+initGlobalAPI(Vue$2);
 
-Object.defineProperty(Vue$3.prototype, '$isServer', {
+Object.defineProperty(Vue$2.prototype, '$isServer', {
   get: isServerRendering
 });
 
-Object.defineProperty(Vue$3.prototype, '$ssrContext', {
+Object.defineProperty(Vue$2.prototype, '$ssrContext', {
   get: function get () {
     /* istanbul ignore next */
     return this.$vnode && this.$vnode.ssrContext
   }
 });
 
-Vue$3.version = '2.4.1';
-Vue$3.mpvueVersion = '2.0.6';
+Vue$2.version = '2.4.1';
+Vue$2.mpvueVersion = '2.0.6';
 
 /* globals renderer */
 
@@ -4243,6 +4264,58 @@ var eventTypeMap = {
   scrolltolower: ['scrolltolower'],
   scroll: ['scroll']
 };
+
+// vm上的数据深拷贝，小程序里不支持eval函数，暂不支持函数拷贝
+function isObject$1 (obj) {
+  return (typeof obj === 'object') && obj !== null
+}
+
+function cloneDeep (data, hash) {
+  if ( hash === void 0 ) hash = new WeakMap();
+
+  if (!isObject$1(data) || !data || !data.constructor) {
+    return data
+  }
+  var copyData;
+  var Constructor = data.constructor;
+  // 实际情况中，正则表达式会被以{}存储，Date对象会以时间字符串形式存储
+  // 函数则变为null
+  switch (Constructor) {
+    case RegExp:
+      copyData = new Constructor(data);
+      break
+    case Date:
+      copyData = new Constructor(data.getTime());
+      break
+    default:
+      // 循环引用问题解决
+      if (hash.has(data)) {
+        return hash.get(data)
+      }
+      copyData = new Constructor();
+      if (Constructor === Map) {
+        data.forEach(function (value, key) {
+          copyData.set(key, isObject$1(value) ? cloneDeep(value) : value);
+        });
+      }
+      if (Constructor === Set) {
+        data.forEach(function (value) {
+          copyData.add(isObject$1(value) ? cloneDeep(value) : value);
+        });
+      }
+      hash.set(data, copyData);
+  }
+  var symbols = Object.getOwnPropertySymbols(data);
+  if (symbols && symbols.length) {
+    symbols.forEach(function (symkey) {
+      copyData[symkey] = isObject$1(data[symkey]) ? cloneDeep(data[symkey], hash) : data[symkey];
+    });
+  }
+  for (var key in data) {
+    copyData[key] = isObject$1(data[key]) ? cloneDeep(data[key], hash) : data[key];
+  }
+  return copyData
+}
 
 /*  */
 
@@ -4978,6 +5051,10 @@ function patch () {
   this.$updateDataToMP();
 }
 
+function _next (rootVueVM) {
+  return mountComponent(rootVueVM, undefined, undefined)
+}
+
 function callHook$1 (vm, hook, params) {
   var handlers = vm.$options[hook];
   if (hook === 'onError' && handlers) {
@@ -5146,7 +5223,6 @@ function initMP (mpType, next) {
   // Please do not register multiple Pages
   // if (mp.registered) {
   if (mp.status) {
-    // 处理子组件的小程序生命周期
     if (mpType === 'app') {
       callHook$1(this, 'onLaunch', mp.appOptions);
     } else {
@@ -5159,7 +5235,13 @@ function initMP (mpType, next) {
 
   mp.mpType = mpType;
   mp.status = 'register';
+}
 
+function createMP (ref) {
+  var mpType = ref.mpType;
+  var init = ref.init;
+
+  if (!mpType) { mpType = 'page'; }
   if (mpType === 'app') {
     global.App({
       // 页面的初始数据
@@ -5168,92 +5250,58 @@ function initMP (mpType, next) {
       },
 
       handleProxy: function handleProxy (e) {
-        return rootVueVM.$handleProxyWithVue(e)
+        return this.rootVueVM.$handleProxyWithVue(e)
       },
 
       // Do something initial when launch.
       onLaunch: function onLaunch (options) {
         if ( options === void 0 ) options = {};
 
+        if (!this.rootVueVM) {
+          this.rootVueVM = init();
+          this.rootVueVM.$mp = {};
+        }
+        var mp = this.rootVueVM.$mp;
+        mp.mpType = 'app';
         mp.app = this;
         mp.status = 'launch';
         this.globalData.appOptions = mp.appOptions = options;
-        callHook$1(rootVueVM, 'onLaunch', options);
-        next();
+        this.rootVueVM.$mount();
       },
 
       // Do something when app show.
       onShow: function onShow (options) {
         if ( options === void 0 ) options = {};
 
+        // 百度小程序onLaunch与onShow存在bug
+        // 如果this.rootVueVM不存在则初始化
+        if (!this.rootVueVM) {
+          this.rootVueVM = init();
+          this.rootVueVM.$mp = {};
+        }
+        var mp = this.rootVueVM.$mp;
         mp.status = 'show';
         this.globalData.appOptions = mp.appOptions = options;
-        callHook$1(rootVueVM, 'onShow', options);
+        callHook$1(this.rootVueVM, 'onShow', options);
       },
 
       // Do something when app hide.
       onHide: function onHide () {
+        var mp = this.rootVueVM.$mp;
         mp.status = 'hide';
-        callHook$1(rootVueVM, 'onHide');
+        callHook$1(this.rootVueVM, 'onHide');
       },
 
       onError: function onError (err) {
-        callHook$1(rootVueVM, 'onError', err);
+        callHook$1(this.rootVueVM, 'onError', err);
       },
 
       onPageNotFound: function onPageNotFound (err) {
-        callHook$1(rootVueVM, 'onPageNotFound', err);
+        callHook$1(this.rootVueVM, 'onPageNotFound', err);
       }
     });
-  } else if (mpType === 'component') {
-    initMpProps(rootVueVM);
-
-    global.Component({
-      // 小程序原生的组件属性
-      properties: normalizeProperties(rootVueVM),
-      // 页面的初始数据
-      data: {
-        $root: {}
-      },
-      methods: {
-        handleProxy: function handleProxy (e) {
-          return rootVueVM.$handleProxyWithVue(e)
-        }
-      },
-      // mp lifecycle for vue
-      // 组件生命周期函数，在组件实例进入页面节点树时执行，注意此时不能调用 setData
-      created: function created () {
-        mp.status = 'created';
-        mp.page = this;
-      },
-      // 组件生命周期函数，在组件实例进入页面节点树时执行
-      attached: function attached () {
-        mp.status = 'attached';
-        callHook$1(rootVueVM, 'attached');
-      },
-      // 组件生命周期函数，在组件布局完成后执行，此时可以获取节点信息（使用 SelectorQuery ）
-      ready: function ready () {
-        mp.status = 'ready';
-
-        callHook$1(rootVueVM, 'ready');
-        next();
-
-        // 只有页面需要 setData
-        rootVueVM.$nextTick(function () {
-          rootVueVM._initDataToMP();
-        });
-      },
-      // 组件生命周期函数，在组件实例被移动到节点树另一个位置时执行
-      moved: function moved () {
-        callHook$1(rootVueVM, 'moved');
-      },
-      // 组件生命周期函数，在组件实例被从页面节点树移除时执行
-      detached: function detached () {
-        mp.status = 'detached';
-        callHook$1(rootVueVM, 'detached');
-      }
-    });
-  } else {
+  }
+  if (mpType === 'page') {
     var app = global.getApp();
     global.Page({
       // 页面的初始数据
@@ -5262,75 +5310,142 @@ function initMP (mpType, next) {
       },
 
       handleProxy: function handleProxy (e) {
-        return rootVueVM.$handleProxyWithVue(e)
+        return this.rootVueVM.$handleProxyWithVue(e)
       },
 
       // mp lifecycle for vue
       // 生命周期函数--监听页面加载
       onLoad: function onLoad (query) {
+        this.rootVueVM = init();
+        var mp = this.rootVueVM.$mp = {};
+        mp.mpType = 'page';
         mp.page = this;
         mp.query = query;
         mp.status = 'load';
-        getGlobalData(app, rootVueVM);
-        callHook$1(rootVueVM, 'onLoad', query);
+        getGlobalData(app, this.rootVueVM);
+        this.rootVueVM.$mount();
       },
 
       // 生命周期函数--监听页面显示
       onShow: function onShow () {
+        var this$1 = this;
+
+        var mp = this.rootVueVM.$mp;
         mp.page = this;
         mp.status = 'show';
-        callHook$1(rootVueVM, 'onShow');
-
+        callHook$1(this.rootVueVM, 'onShow');
         // 只有页面需要 setData
-        rootVueVM.$nextTick(function () {
-          rootVueVM._initDataToMP();
+        this.rootVueVM.$nextTick(function () {
+          this$1.rootVueVM._initDataToMP();
         });
       },
 
       // 生命周期函数--监听页面初次渲染完成
       onReady: function onReady () {
+        var mp = this.rootVueVM.$mp;
         mp.status = 'ready';
-
-        callHook$1(rootVueVM, 'onReady');
-        next();
+        return _next(this.rootVueVM)
       },
 
       // 生命周期函数--监听页面隐藏
       onHide: function onHide () {
+        var mp = this.rootVueVM.$mp;
         mp.status = 'hide';
-        callHook$1(rootVueVM, 'onHide');
+        callHook$1(this.rootVueVM, 'onHide');
         mp.page = null;
       },
 
       // 生命周期函数--监听页面卸载
       onUnload: function onUnload () {
+        var mp = this.rootVueVM.$mp;
         mp.status = 'unload';
-        callHook$1(rootVueVM, 'onUnload');
+        callHook$1(this.rootVueVM, 'onUnload');
         mp.page = null;
       },
 
       // 页面相关事件处理函数--监听用户下拉动作
       onPullDownRefresh: function onPullDownRefresh () {
-        callHook$1(rootVueVM, 'onPullDownRefresh');
+        callHook$1(this.rootVueVM, 'onPullDownRefresh');
       },
 
       // 页面上拉触底事件的处理函数
       onReachBottom: function onReachBottom () {
-        callHook$1(rootVueVM, 'onReachBottom');
+        callHook$1(this.rootVueVM, 'onReachBottom');
       },
 
       // 用户点击右上角分享
-      onShareAppMessage: rootVueVM.$options.onShareAppMessage
-        ? function (options) { return callHook$1(rootVueVM, 'onShareAppMessage', options); } : null,
+      onShareAppMessage: function onShareAppMessage (options) {
+        if (this.rootVueVM.$options.onShareAppMessage) {
+          callHook$1(this.rootVueVM, 'onShareAppMessage', options);
+        }
+      },
 
       // Do something when page scroll
       onPageScroll: function onPageScroll (options) {
-        callHook$1(rootVueVM, 'onPageScroll', options);
+        callHook$1(this.rootVueVM, 'onPageScroll', options);
       },
 
       // 当前是 tab 页时，点击 tab 时触发
       onTabItemTap: function onTabItemTap (options) {
-        callHook$1(rootVueVM, 'onTabItemTap', options);
+        callHook$1(this.rootVueVM, 'onTabItemTap', options);
+      }
+    });
+  }
+  if (mpType === 'component') {
+    global.Component({
+      // 小程序原生的组件属性
+      properties: {},
+      // 页面的初始数据
+      data: {
+        $root: {}
+      },
+      methods: {
+        handleProxy: function handleProxy (e) {
+          return this.rootVueVM.$handleProxyWithVue(e)
+        }
+      },
+      // mp lifecycle for vue
+      // 组件生命周期函数，在组件实例进入页面节点树时执行，注意此时不能调用 setData
+      created: function created () {
+        this.rootVueVM = init();
+        initMpProps(this.rootVueVM);
+        this.properties = normalizeProperties(this.rootVueVM);
+        var mp = this.rootVueVM.$mp = {};
+        mp.mpType = 'component';
+        mp.status = 'created';
+        mp.page = this;
+        this.rootVueVM.$mount();
+        callHook$1(this.rootVueVM, 'created');
+      },
+      // 组件生命周期函数，在组件实例进入页面节点树时执行
+      attached: function attached () {
+        var mp = this.rootVueVM.$mp;
+        mp.status = 'attached';
+        callHook$1(this.rootVueVM, 'attached');
+      },
+      // 组件生命周期函数，在组件布局完成后执行，此时可以获取节点信息（使用 SelectorQuery ）
+      ready: function ready () {
+        var this$1 = this;
+
+        var mp = this.rootVueVM.$mp;
+        mp.status = 'ready';
+        callHook$1(this.rootVueVM, 'ready');
+        _next(this.rootVueVM);
+
+        // 只有页面需要 setData
+        this.rootVueVM.$nextTick(function () {
+          this$1.rootVueVM._initDataToMP();
+        });
+      },
+      // 组件生命周期函数，在组件实例被移动到节点树另一个位置时执行
+      moved: function moved () {
+        callHook$1(this.rootVueVM, 'moved');
+      },
+      // 组件生命周期函数，在组件实例被从页面节点树移除时执行
+      detached: function detached () {
+        var mp = this.rootVueVM.$mp;
+        mp.status = 'detached';
+        callHook$1(this.rootVueVM, 'detached');
       }
     });
   }
@@ -5339,15 +5454,15 @@ function initMP (mpType, next) {
 var updateDataTotal = 0; // 总共更新的数据量
 function diffLog (updateData) {
   updateData = JSON.stringify(updateData);
-  if (!Vue$3._mpvueTraceTimer) {
-    Vue$3._mpvueTraceTimer = setTimeout(function () {
-      clearTimeout(Vue$3._mpvueTraceTimer);
+  if (!Vue$2._mpvueTraceTimer) {
+    Vue$2._mpvueTraceTimer = setTimeout(function () {
+      clearTimeout(Vue$2._mpvueTraceTimer);
       updateDataTotal = (updateDataTotal / 1024).toFixed(1);
       console.log('这次操作引发500ms内数据更新量:' + updateDataTotal + 'kb');
-      Vue$3._mpvueTraceTimer = 0;
+      Vue$2._mpvueTraceTimer = 0;
       updateDataTotal = 0;
     }, 500);
-  } else if (Vue$3._mpvueTraceTimer) {
+  } else if (Vue$2._mpvueTraceTimer) {
     updateData = updateData.replace(/[^\u0000-\u00ff]/g, 'aa'); // 中文占2字节，中文替换成两个字母计算占用空间
     updateDataTotal += updateData.length;
   }
@@ -5373,23 +5488,68 @@ function getDeepData (keyList, viewData) {
   }
 }
 
-function compareAndSetDeepData (key, newData, vm, data, forceUpdate) {
+function deepDiff (oldData, newData, data, key) {
+  if (oldData === newData) {
+    return
+  }
+  // 新旧数据如果存在值为null则添加到需要更新的表中
+  if (oldData === null || newData === null) {
+    data[key] = newData;
+    return
+  }
+  if (Object.prototype.toString.call(oldData) !== Object.prototype.toString.call(newData)) {
+    data[key] = newData;
+    return
+  }
+  // 如果新旧数据均为数组，则进行diff
+  if (Array.isArray(newData) && Array.isArray(oldData)) {
+    if (newData.length === oldData.length) {
+      for (var i = 0, len = newData.length; i < len; i++) {
+        // 递归处理，处理数据中包含数据或者包含对象的情况
+        deepDiff(oldData[i], newData[i], data, key + '[' + i + ']');
+      }
+    } else {
+      // 数组长度不一样直接setData
+      data[key] = newData;
+    }
+    return
+  }
+  // 如果新旧数据均为对象，进行diff
+  if (typeof oldData === 'object' && typeof newData === 'object') {
+    var newKeys = Object.keys(newData);
+    var oldKeys = Object.keys(oldData);
+    var uniqueKeys = new Set(newKeys.concat( oldKeys));
+    uniqueKeys.forEach(function (itemKey) {
+      if (oldData[itemKey] &&
+        newData[itemKey] &&
+        typeof newData[itemKey] === 'object' &&
+        Object.prototype.toString.call(oldData) === Object.prototype.toString.call(newData)
+      ) {
+        deepDiff(oldData[itemKey], newData[itemKey], data, key + '.' + itemKey);
+        return
+      }
+      if (oldData[itemKey] !== newData[itemKey]) {
+        data[key + '.' + itemKey] = newData[itemKey];
+      }
+    });
+    return
+  }
+  if (oldData !== newData) {
+    data[key] = newData;
+  }
+}
+
+function compareAndSetDeepData (key, newData, vm, data) {
   // 比较引用类型数据
   try {
     var keyList = key.split('.');
     // page.__viewData__老版小程序不存在，使用mpvue里绑的data比对
     var oldData = getDeepData(keyList, vm.$root.$mp.page.data);
-    if (oldData === null || JSON.stringify(oldData) !== JSON.stringify(newData) || forceUpdate) {
+    if (!oldData) {
       data[key] = newData;
-    } else {
-      var keys = Object.keys(oldData);
-      keys.forEach(function (_key) {
-        var properties = Object.getOwnPropertyDescriptor(oldData, _key);
-        if (!properties['get'] && !properties['set']) {
-          data[key + '.' + _key] = newData[_key];
-        }
-      });
+      return
     }
+    deepDiff(oldData, newData, data, key);
   } catch (e) {
     console.log(e, key, newData, vm);
   }
@@ -5407,7 +5567,7 @@ function minifyDeepData (rootKey, originKey, vmData, data, _mpValueSet, vm) {
   try {
     if (vmData instanceof Array) {
        // 数组
-      compareAndSetDeepData(rootKey + '.' + originKey, vmData, vm, data, true);
+      compareAndSetDeepData(rootKey + '.' + originKey, vmData, vm, data);
     } else {
       // Object
       var _keyPathOnThis = {}; // 存储这层对象的keyPath
@@ -5466,7 +5626,7 @@ function diffData (vm, data) {
   } else {
     rootKey = getRootKey(vm, vm.$attrs.mpcomid);
   }
-  Vue$3.nextTick(function () {
+  Vue$2.nextTick(function () {
     cleanKeyPath(vm);
   });
   // console.log(rootKey)
@@ -5516,7 +5676,7 @@ function diffData (vm, data) {
     // 第一次设置数据成功后，标记位置true,再更新到这个节点如果没有keyPath数组认为不需要更新
     vm._mpValueSet = 'done';
   }
-  if (Vue$3.config._mpTrace) {
+  if (Vue$2.config._mpTrace) {
     // console.log('更新VM节点', vm)
     // console.log('实际传到Page.setData数据', data)
     diffLog(data);
@@ -5554,7 +5714,7 @@ function getVmData (vm) {
     Object.keys(vm._computedWatchers || {})
   );
   return dataKeys.reduce(function (res, key) {
-    res[key] = vm[key];
+    res[key] = cloneDeep(vm[key]);
     return res
   }, {})
 }
@@ -5645,6 +5805,9 @@ function throttle (func, wait, options) {
 
 // 优化频繁的 setData: https://mp.weixin.qq.com/debug/wxadoc/dev/framework/performance/tips.html
 var throttleSetData = throttle(function (handle, data) {
+  if (!Object.keys(data).length) {
+    return
+  }
   handle(data);
 }, 50);
 
@@ -5669,7 +5832,7 @@ function updateDataToMP () {
     return
   }
 
-  var data = formatVmData(this);
+  var data = {};
   diffData(this, data);
   throttleSetData(page.setData.bind(page), data);
 }
@@ -5831,17 +5994,17 @@ function handleProxyWithVue (e) {
 // for platforms
 // import config from 'core/config'
 // install platform specific utils
-Vue$3.config.mustUseProp = mustUseProp;
-Vue$3.config.isReservedTag = isReservedTag;
-Vue$3.config.isReservedAttr = isReservedAttr;
-Vue$3.config.getTagNamespace = getTagNamespace;
-Vue$3.config.isUnknownElement = isUnknownElement;
+Vue$2.config.mustUseProp = mustUseProp;
+Vue$2.config.isReservedTag = isReservedTag;
+Vue$2.config.isReservedAttr = isReservedAttr;
+Vue$2.config.getTagNamespace = getTagNamespace;
+Vue$2.config.isUnknownElement = isUnknownElement;
 
 // install platform patch function
-Vue$3.prototype.__patch__ = patch;
+Vue$2.prototype.__patch__ = patch;
 
 // public mount method
-Vue$3.prototype.$mount = function (el, hydrating) {
+Vue$2.prototype.$mount = function (el, hydrating) {
   var this$1 = this;
 
   // el = el && inBrowser ? query(el) : undefined
@@ -5861,15 +6024,20 @@ Vue$3.prototype.$mount = function (el, hydrating) {
 };
 
 // for mp
-Vue$3.prototype._initMP = initMP;
+Vue$2.prototype._initMP = initMP;
 
-Vue$3.prototype.$updateDataToMP = updateDataToMP;
-Vue$3.prototype._initDataToMP = initDataToMP;
+Vue$2.prototype.$updateDataToMP = updateDataToMP;
+Vue$2.prototype._initDataToMP = initDataToMP;
 
-Vue$3.prototype.$handleProxyWithVue = handleProxyWithVue;
+Vue$2.prototype.$handleProxyWithVue = handleProxyWithVue;
 
 /*  */
 
-return Vue$3;
+var entryRuntime = {
+  Vue: Vue$2,
+  createMP: createMP
+};
+
+return entryRuntime;
 
 })));
